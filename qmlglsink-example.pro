@@ -13,3 +13,9 @@ INCLUDEPATH += src
 
 QMAKE_CXXFLAGS += -Wextra -Wall -std=c++14 -pedantic -fPIC -DPIC -O0 -g3 -ggdb
 QMAKE_LFLAGS += -fPIC -DPIC
+
+isEmpty(PREFIX) {
+	PREFIX = /usr/local
+}
+target.path = $$PREFIX/bin
+INSTALLS += target
