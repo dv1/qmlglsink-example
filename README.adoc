@@ -1,0 +1,13 @@
+= Simple example of how to use GStreamer's qmlglsink
+
+This is a simple application that starts a Qt5 QML interface and plays a video in a QML item.
+That QML item is the GLVideoItem that is registered by GStreamer's https://gstreamer.freedesktop.org/documentation/qmlgl/qmlglsink.html[qmlglsink].
+It uses a basic playbin based pipeline.
+
+To build it, run:
+
+    make build
+    qmake ..
+    make
+
+This produces a `qmlglsink-example` binary. Use the `--help` switch to get a list of valid options.
