@@ -9,6 +9,7 @@
 #include <signal.h>
 #include <unistd.h>
 
+#include <QRunnable>
 #include <QGuiApplication>
 #include <QQuickItem>
 #include <QQuickWindow>
@@ -277,6 +278,35 @@ private:
 };
 
 
+// Helper class to start the pipeline once the scenegraph is up and running.
+
+class SetPlayingJob
+	: public QRunnable
+{
+public:
+	explicit SetPlayingJob(Pipeline &pipeline, QQuickItem *qmlVideoItem, QCoreApplication &application)
+		: m_pipeline(pipeline)
+		, m_qmlVideoItem(qmlVideoItem)
+		, m_application(application)
+	{
+	}
+
+	void run() override
+	{
+		if (!m_pipeline.start(m_qmlVideoItem))
+		{
+			qCritical() << "Could not start pipeline; quitting";
+			m_application.quit();
+		}
+	}
+
+private:
+	Pipeline &m_pipeline;
+	QQuickItem *m_qmlVideoItem;
+	QCoreApplication &m_application;
+};
+
+
 int main(int argc, char *argv[])
 {
 	{
@@ -418,6 +448,10 @@ int main(int argc, char *argv[])
 	}
 
 
+	// NOTE: On Wayland and X11, both of these approaches work.
+	// On EGLFS however, only the second renderjob based approach
+	// works. It is currently unknown why this is the case.
+#if 0
 	// Connect to sceneGraphInitialized to start the pipeline as soon as the
 	// QML interface is up and running. Trying to start the pipeline earlier
 	// produces errors because qmlglsink can't get the EGL context.
@@ -430,6 +464,17 @@ int main(int argc, char *argv[])
 			app.quit();
 		}
 	});
+#else
+	// Create an instance of the SetPlayingJob helper class and schedule it
+	// to be run as a render job. This is a trick to ensure that the pipeline
+	// start code that is located inside SetPlayingJob::run() is executed
+	// _after_ the scenegraph is up and running, implying that the EGL context
+	// is initialized and valid (this is required by qmlglsink).
+	mainWindow->scheduleRenderJob(
+		new SetPlayingJob(pipeline, videoItem, app),
+		QQuickWindow::BeforeSynchronizingStage
+	);
+#endif
 
 
 	return app.exec();
