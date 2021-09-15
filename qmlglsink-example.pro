@@ -1,4 +1,4 @@
-PKGCONFIG += gstreamer-1.0
+PKGCONFIG += gstreamer-1.0 gstreamer-app-1.0
 CONFIG += qt c++14 link_pkgconfig moc
 QT += core qml quick
 

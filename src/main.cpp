@@ -5,6 +5,7 @@
 #include <map>
 
 #include <gst/gst.h>
+#include <gst/app/app.h>
 
 #include <signal.h>
 #include <unistd.h>
@@ -16,6 +17,7 @@
 #include <QQmlApplicationEngine>
 #include <QCommandLineParser>
 #include <QSocketNotifier>
+#include <QString>
 
 #include "ScopeGuard.hpp"
 
@@ -171,7 +173,7 @@ public:
 	}
 
 
-	bool setup(QString inputUrl)
+	bool setup(QString inputUrl, QObject *qmlSubtitleItem)
 	{
 		// Scope guard to cleanup the pipeline in case setup fails.
 		auto pipelineGuard = makeScopeGuard([&]() {
@@ -181,6 +183,10 @@ public:
 				m_playbin = nullptr;
 			}
 		});
+
+
+		// Store the pointer to be able to set its subtitle property later.
+		m_qmlSubtitleItem = qmlSubtitleItem;
 
 
 		// Create the pipeline.
@@ -195,19 +201,34 @@ public:
 			return false;
 		}
 
+		GstElement *glsinkbin = nullptr;
+		GstElement *subtitleAppsink = nullptr;
+
+		// Scope guard to make sure the elements above are always
+		// unref'd in case an error occurs. This guard is needed
+		// until these elements are transferred over to playbin.
+		auto elementUnrefGuard = makeScopeGuard([&]() {
+			if (glsinkbin != nullptr)
+				gst_object_unref(GST_OBJECT(glsinkbin));
+			if (subtitleAppsink != nullptr)
+				gst_object_unref(GST_OBJECT(subtitleAppsink));
+		});
+
 		// Create the glsinkbin. This will be used as the video sink by playbin.
-		GstElement *glsinkbin = gst_element_factory_make("glsinkbin", nullptr);
+		glsinkbin = gst_element_factory_make("glsinkbin", nullptr);
 		if (glsinkbin == nullptr)
 		{
 			qCritical() << "Could not create glsinkbin element";
 			return false;
 		}
 
-		// Scope guard to make sure the glsinkbin is always unref'd
-		// in case an error occurs.
-		auto glsinkbinGuard = makeScopeGuard([&]() {
-			gst_object_unref(glsinkbin);
-		});
+		// Create the appsink that will be used for extracting subtitles.
+		subtitleAppsink = gst_element_factory_make("appsink", nullptr);
+		if (subtitleAppsink == nullptr)
+		{
+			qCritical() << "Could not create subtitle appsink element";
+			return false;
+		}
 
 		// Create the qmlglsink and assign it to the glsinkbin, which
 		// takes ownership over that qmlglsink.
@@ -224,16 +245,45 @@ public:
 		// (color balancing, deinterlacing ...) but keeps software based audio
 		// postprocessing enabled. Disabling the video postprocessing is essential
 		// on embedded platforms to minimize stutter (which is cause by a saturated CPU).
+		// Also, set the subtitleAppsink as the "text sink" (aka the subtitle sink).
 		g_object_set(
 			m_playbin,
 			"uri", inputUrl.toStdString().c_str(),
 			"flags", gint(0x57),
 			"video-sink", glsinkbin,
+			"text-sink", subtitleAppsink,
 			nullptr
 		);
 
-		// playbin owns the glsinkbin now. The scope guard is no longer needed.
-		glsinkbinGuard.dismiss();
+		// playbin owns the glsinkbin and subtitle appsink now.
+		// The scope guard is no longer needed.
+		elementUnrefGuard.dismiss();
+
+		// Set the appsink callbacks to be informed whenever new subtitles are read.
+		// These subtitles can then be displayed in QML.
+		{
+			GstAppSinkCallbacks subtitleAppsinkCallbacks = {};
+			subtitleAppsinkCallbacks.new_sample = &staticOnNewSubtitle;
+
+			gst_app_sink_set_callbacks(
+				GST_APP_SINK(subtitleAppsink),
+				&subtitleAppsinkCallbacks,
+				gpointer(this),
+				nullptr
+			);
+
+			// Further refine appsink behavior:
+			// - Enable the drop property to make sure the appsink never blocks.
+			//   If subtitles are not shown in time, we anyway do not want to
+			//   show them anymore, so it is OK to drop stale subtitles.
+			// - Set max-buffers to 1 since we do not want a queue of subtitles.
+			g_object_set(
+				G_OBJECT(subtitleAppsink),
+				"drop", gboolean(TRUE),
+				"max-buffers", guint(1),
+				nullptr
+			);
+		}
 
 
 		// Note that a proper application would also install a GStreamer bus watch
@@ -273,8 +323,37 @@ public:
 
 
 private:
+	static GstFlowReturn staticOnNewSubtitle(GstAppSink *subtitleAppsink, gpointer userData)
+	{
+		Pipeline *self = reinterpret_cast<Pipeline *>(userData);
+
+		// Extract the subtitle text from the GstBuffer inside the newest GstSample.
+
+		GstSample *subtitleSample = gst_app_sink_pull_sample(subtitleAppsink);
+		GstBuffer *subtitleBuffer = gst_sample_get_buffer(subtitleSample);
+
+		GstMapInfo mapInfo;
+		gst_buffer_map(subtitleBuffer, &mapInfo, GST_MAP_READ);
+		auto guard = makeScopeGuard([&]() {
+			gst_buffer_unmap(subtitleBuffer, &mapInfo);
+		});
+
+		// NOTE: Typically, the subtitle buffers do _not_ contain
+		// a trailing nullbyte.
+		QString subtitle = QString::fromUtf8(
+			reinterpret_cast<char const *>(mapInfo.data),
+			mapInfo.size
+		);
+
+		qDebug() << "Subtitle:" << subtitle;
+		self->m_qmlSubtitleItem->setProperty("subtitle", subtitle);
+
+		return GST_FLOW_OK;
+	}
+
 	GstElement *m_playbin = nullptr;
 	GstElement *m_qmlglsink = nullptr;
+	QObject *m_qmlSubtitleItem = nullptr;
 };
 
 
@@ -417,14 +496,14 @@ int main(int argc, char *argv[])
 	}
 
 
-	Pipeline pipeline;
-	if (!pipeline.setup(inputUrl))
-		return -1;
-
-
 	// Get the main QML user interface window. The window is the
 	// root object in the QML user interface hierarchy.
 	QQuickWindow *mainWindow = qobject_cast<QQuickWindow*>(qml_engine.rootObjects().value(0));
+
+
+	Pipeline pipeline;
+	if (!pipeline.setup(inputUrl, mainWindow))
+		return -1;
 
 	// Install the signal handlers. They will call the main window's
 	// quit() application when these handlers catch a signal.
